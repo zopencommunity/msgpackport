@@ -104,11 +104,32 @@ check("version is the one this port builds",
           int(n) for n in os.environ["MSGPACK_EXPECTED_VERSION"].split(".")))
 
 # The C extension is the point of this port. msgpack falls back to a pure
-# Python implementation when it is missing, and everything below still passes
-# on the fallback -- so check explicitly that the compiled one is in use.
+# Python implementation when it is missing, and every functional check below
+# still passes on the fallback -- so verify explicitly that the compiled one is
+# in use, and say enough on failure to tell why.
+#
+# The two ways this goes wrong look identical from the outside: the wheel's
+# extension failed to load, or some other msgpack shadowed the installed one.
+# Printing where msgpack was imported from separates them immediately.
+def uses_c_extension():
+    if "_cmsgpack" in getattr(msgpack.Packer, "__module__", ""):
+        return True
+    print("       msgpack imported from : %s" % msgpack.__file__, file=sys.stderr)
+    print("       Packer.__module__     : %s" % msgpack.Packer.__module__,
+          file=sys.stderr)
+    try:
+        import msgpack._cmsgpack  # noqa: F401
+        print("       _cmsgpack imports, but Packer came from elsewhere",
+              file=sys.stderr)
+    except ImportError as exc:
+        print("       _cmsgpack import error: %s" % exc, file=sys.stderr)
+    for entry in sys.path[:6]:
+        print("       sys.path: %r" % entry, file=sys.stderr)
+    return False
+
+
 check("the C extension is in use, not the pure Python fallback",
-      lambda: getattr(msgpack, "_cmsgpack", None) is not None
-      or "_cmsgpack" in getattr(msgpack.Packer, "__module__", ""))
+      uses_c_extension)
 
 check("round trip preserves a nested structure",
       lambda: msgpack.unpackb(msgpack.packb({"a": [1, 2, 3], "b": {"c": True}}))
