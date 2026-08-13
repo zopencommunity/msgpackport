@@ -1,0 +1,179 @@
+# bump: msgpack-version /MSGPACK_VERSION="(.*)"/ https://github.com/msgpack/msgpack-python.git|semver:*
+MSGPACK_VERSION="1.2.1"
+
+###
+### Build control file for the msgpack port
+###
+### msgpack is a C extension with no external library dependencies and no
+### runtime dependencies, so this is close to the minimum a Python port can be:
+### the standard build system compiles it once per interpreter and there is
+### nothing to link against beyond the C runtime.
+###
+### It is wanted for its consumers rather than itself -- poetry among them.
+###
+
+export ZOPEN_PROJECT_NAME="msgpack"
+export ZOPEN_BUILD_LINE="STABLE"
+export ZOPEN_CATEGORIES="development library"
+
+export ZOPEN_STABLE_URL="https://github.com/msgpack/msgpack-python.git"
+export ZOPEN_STABLE_TAG="v${MSGPACK_VERSION}"
+export ZOPEN_DEV_URL="https://github.com/msgpack/msgpack-python.git"
+
+# Cython is a build requirement: the repository ships _cmsgpack.pyx rather than
+# generated C, so a git checkout has nothing to compile without it. Building
+# from the sdist would not need it, but a port builds from the tag.
+export ZOPEN_STABLE_DEPS="check_python make"
+export ZOPEN_DEV_DEPS="check_python make"
+export ZOPEN_RUNTIME_DEPS="check_python"
+
+export ZOPEN_BUILD_SYSTEM="Python"
+
+zopen_get_version() {
+  echo "${MSGPACK_VERSION}"
+}
+
+# The repository ships msgpack/_cmsgpack.pyx and no generated C. setup.py does
+# not run Cython itself -- upstream's Makefile carries a "cython" target for
+# that, and their release process runs it before packaging. Building from a git
+# tag therefore has to generate the C first, or the compile fails with
+#
+#   clang-14: error: no such file or directory: 'msgpack/_cmsgpack.c'
+#
+# which reads like a missing file rather than a missing build step.
+#
+# Cython goes in a throwaway virtual environment rather than any of the
+# per-interpreter ones: the generated C is the same whichever interpreter
+# produced it, and this runs once before the matrix loop starts.
+zopen_pre_build() {
+  _mp_py=$(_zopen_python_interpreter_path "$(_zopen_python_primary_version)") || return 1
+  rm -rf .cythonenv
+  "${_mp_py}" -m venv .cythonenv || return 1
+  .cythonenv/bin/pip install --disable-pip-version-check --quiet cython || return 1
+  printInfo "Generating msgpack/_cmsgpack.c with $(.cythonenv/bin/cython --version 2>&1)"
+  .cythonenv/bin/cython msgpack/_cmsgpack.pyx || return 1
+  rm -rf .cythonenv
+  [ -f msgpack/_cmsgpack.c ] || {
+    printError "Cython did not produce msgpack/_cmsgpack.c"
+    return 1
+  }
+}
+
+# Called once per interpreter, with that interpreter's environment active and
+# its freshly built wheel installed.
+zopen_python_test() {
+  MSGPACK_EXPECTED_VERSION="${MSGPACK_VERSION}" python - <<'PYEOF'
+import os
+import sys
+
+# The check exercises the installed wheel. python reads this script from stdin
+# and so puts "" first on sys.path, and the build directory holds a msgpack
+# source tree -- without this, "import msgpack" finds the sources, which have
+# no compiled extension.
+sys.path = [p for p in sys.path if p not in ("", ".")]
+
+failures = 0
+total = 0
+
+
+def check(label, fn):
+    global failures, total
+    total += 1
+    try:
+        if fn():
+            print("PASS:", label)
+        else:
+            print("FAIL:", label, file=sys.stderr)
+            failures += 1
+    except Exception as exc:
+        print("FAIL:", label, "-", exc, file=sys.stderr)
+        failures += 1
+
+
+try:
+    import msgpack
+except ImportError as exc:
+    # Report rather than crash, so zopen_check_results sees a count instead of
+    # an empty log.
+    print("FAIL: import msgpack -", exc, file=sys.stderr)
+    print("msgpack FAILED to import on Python %s" % sys.version.split()[0])
+    sys.exit(1)
+
+check("version is the one this port builds",
+      lambda: msgpack.version == tuple(
+          int(n) for n in os.environ["MSGPACK_EXPECTED_VERSION"].split(".")))
+
+# The C extension is the point of this port. msgpack falls back to a pure
+# Python implementation when it is missing, and everything below still passes
+# on the fallback -- so check explicitly that the compiled one is in use.
+check("the C extension is in use, not the pure Python fallback",
+      lambda: getattr(msgpack, "_cmsgpack", None) is not None
+      or "_cmsgpack" in getattr(msgpack.Packer, "__module__", ""))
+
+check("round trip preserves a nested structure",
+      lambda: msgpack.unpackb(msgpack.packb({"a": [1, 2, 3], "b": {"c": True}}))
+      == {"a": [1, 2, 3], "b": {"c": True}})
+
+# Binary payloads are where an encoding bug on this platform would show first.
+blob = bytes(range(256))
+check("binary payload survives unchanged",
+      lambda: msgpack.unpackb(msgpack.packb(blob)) == blob)
+
+check("utf-8 text round trips",
+      lambda: msgpack.unpackb(msgpack.packb({"k": "é中"})) == {"k": "é中"})
+
+# Big-endian correctness: msgpack is a big-endian wire format, so a byte-order
+# mistake would corrupt multi-byte integers rather than fail loudly.
+check("uint32 encodes to the documented bytes",
+      lambda: msgpack.packb(4294967295) == b"\xce\xff\xff\xff\xff")
+check("negative int64 round trips",
+      lambda: msgpack.unpackb(msgpack.packb(-2**63)) == -2**63)
+check("float round trips exactly",
+      lambda: msgpack.unpackb(msgpack.packb(1.5)) == 1.5)
+
+
+def streaming():
+    unpacker = msgpack.Unpacker()
+    unpacker.feed(msgpack.packb(1) + msgpack.packb("two") + msgpack.packb([3]))
+    return list(unpacker) == [1, "two", [3]]
+
+
+check("streaming unpacker", streaming)
+
+print()
+print("msgpack %s on Python %s  --  %d passed, %d failed" % (
+    ".".join(str(n) for n in msgpack.version), sys.version.split()[0],
+    total - failures, failures))
+sys.exit(1 if failures else 0)
+PYEOF
+}
+
+zopen_check_results() {
+  dir="$1"; pfx="$2"; chk="${dir}/${pfx}_check.log"
+  # No "|| echo 0": grep -c prints 0 when nothing matches and also exits 1, so
+  # the fallback appends a second zero and the arithmetic dies with FSUM9224
+  # "bad number" -- on clean runs specifically.
+  passed=$(grep -c "^PASS:" "${chk}" 2>/dev/null)
+  failed=$(grep -c "^FAIL:" "${chk}" 2>/dev/null)
+  passed=${passed:-0}
+  failed=${failed:-0}
+  total=$((passed + failed))
+
+  # An interpreter that printed nothing did not pass, it never ran.
+  interpreters=$(grep -c "^msgpack .* on Python" "${chk}" 2>/dev/null)
+  interpreters=${interpreters:-0}
+  expected=$(echo "${ZOPEN_PYTHON_VERSIONS:-3.12 3.13 3.14}" | wc -w | tr -d ' ')
+  if [ "${interpreters}" -lt "${expected}" ]; then
+    silent=$((expected - interpreters))
+    failed=$((failed + silent))
+    total=$((total + silent))
+  fi
+
+  echo "actualFailures:${failed}"
+  echo "totalTests:${total}"
+  echo "expectedFailures:0"
+}
+
+zopen_append_to_validate_install() {
+  echo "python3 -c \"import msgpack; print('msgpack', msgpack.version)\""
+}
