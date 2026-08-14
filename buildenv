@@ -65,12 +65,23 @@ zopen_python_test() {
   MSGPACK_EXPECTED_VERSION="${MSGPACK_VERSION}" python - <<'PYEOF'
 import os
 import sys
+import sysconfig
 
-# The check exercises the installed wheel. python reads this script from stdin
-# and so puts "" first on sys.path, and the build directory holds a msgpack
-# source tree -- without this, "import msgpack" finds the sources, which have
-# no compiled extension.
-sys.path = [p for p in sys.path if p not in ("", ".")]
+# The check exercises the installed wheel, and msgpack-python keeps its Python
+# package at the repository root, so the source tree shadows it. Dropping ""
+# and "." is not enough: zopen-build runs this with the working directory set
+# to the source tree, and CI showed that directory on sys.path as an *absolute*
+# path, ahead of the venv:
+#
+#   sys.path: '/data/workspace/Port-Build/msgpackport/msgpack-python'
+#   sys.path: '.../.venv-3.14/lib/python3.14/site-packages'
+#
+# "import msgpack" then found the sources, which have no compiled extension, and
+# every functional test below passed against the pure Python fallback while the
+# wheel went unexercised.
+_here = os.getcwd()
+sys.path = [p for p in sys.path
+            if p not in ("", ".") and os.path.abspath(p) != _here]
 
 failures = 0
 total = 0
@@ -98,6 +109,13 @@ except ImportError as exc:
     print("FAIL: import msgpack -", exc, file=sys.stderr)
     print("msgpack FAILED to import on Python %s" % sys.version.split()[0])
     sys.exit(1)
+
+# Prove the guard above worked before trusting anything else. If msgpack came
+# from the build directory rather than site-packages, every check below is
+# measuring the wrong copy.
+check("imported from the installed wheel, not the source tree",
+      lambda: os.path.abspath(msgpack.__file__).startswith(
+          os.path.abspath(sysconfig.get_paths()["purelib"])))
 
 check("version is the one this port builds",
       lambda: msgpack.version == tuple(
