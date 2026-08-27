@@ -1,5 +1,5 @@
 # bump: msgpack-version /MSGPACK_VERSION="(.*)"/ https://github.com/msgpack/msgpack-python.git|semver:*
-MSGPACK_VERSION="1.2.1"
+MSGPACK_VERSION="1.2.2"
 
 ###
 ### Build control file for the msgpack port
